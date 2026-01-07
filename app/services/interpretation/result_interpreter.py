@@ -1,0 +1,363 @@
+import json
+import logging
+import os
+import re
+import glob
+import traceback
+import uuid
+import tempfile
+import shutil
+from typing import Any, Dict, List, Optional
+import asyncio
+
+try:
+    import docker
+    DOCKER_AVAILABLE = True
+except ImportError:
+    DOCKER_AVAILABLE = False
+
+# Check matplotlib availability
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+
+import pandas as pd
+
+from app.llm import LLMClient as LLM
+from app.services.llm.llm_service import LLMService
+from app.services.interpretation.prompts import (
+    INTERPRETATION_SYSTEM_PROMPT,
+    ANALYSIS_PROMPT,
+    CHART_CODE_PROMPT,
+    CHART_CODE_FIX_PROMPT,
+)
+from app.database import init_db
+from app.repository.plan_repository import PlanRepository
+from app.services.plans.plan_executor import PlanExecutor, PlanExecutorLLMService
+
+logger = logging.getLogger(__name__)
+
+class DockerExecutor:
+    def __init__(self, image: str = "agent-plotter", timeout_s: int = 30):
+        self.image = image
+        self.timeout_s = timeout_s
+        if DOCKER_AVAILABLE:
+            try:
+                self.client = docker.from_env()
+            except Exception as e:
+                logger.warning(f"Failed to initialize Docker client: {e}")
+                self.client = None
+        else:
+            self.client = None
+            logger.warning("Docker python client not installed.")
+
+    def execute(self, code: str, output_path: str, data_files: List[str] = []) -> Any:
+        if not self.client:
+            return False, "Docker client not available."
+
+        output_dir = os.path.dirname(output_path)
+        output_prefix = os.path.basename(output_path)
+
+        code = self._instrument_code(code)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            in_dir = os.path.join(temp_dir, "in")
+            out_dir = os.path.join(temp_dir, "out")
+            data_dir = os.path.join(temp_dir, "data")
+            os.makedirs(in_dir, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
+            os.makedirs(data_dir, exist_ok=True)
+
+            # Copy data files to data directory to be mounted
+            for fp in data_files:
+                if os.path.exists(fp):
+                    try:
+                        shutil.copy(fp, data_dir)
+                    except Exception as e:
+                        logger.warning(f"Failed to copy data file {fp} to container context: {e}")
+            
+            script_path = os.path.join(in_dir, "run.py")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(code)
+
+            container = None
+            try:
+                container = self.client.containers.run(
+                    image=self.image,
+                    command="python /in/run.py",
+                    volumes={
+                        os.path.abspath(in_dir): {"bind": "/in", "mode": "ro"},
+                        os.path.abspath(out_dir): {"bind": "/out", "mode": "rw"},
+                        os.path.abspath(data_dir): {"bind": "/data", "mode": "ro"},
+                    },
+                    working_dir="/out",
+                    network_mode="none",
+                    read_only=True,
+                    detach=True,
+                    stderr=True,
+                    stdout=True,
+                    mem_limit="4g",
+                    pids_limit=128,
+                    nano_cpus=2_000_000_000,  # 2 CPUs
+                )
+
+                # Wait with timeout
+                res = container.wait(timeout=self.timeout_s)
+                status = res.get("StatusCode", 1)
+
+                logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+
+                if status != 0:
+                    logger.error(f"Docker execution failed (exit={status}). Logs:\n{logs}")
+                    return False, f"Execution failed (exit={status}). Logs:\n{logs}"
+
+            except Exception as e:
+                if container is not None:
+                    try:
+                        container.kill()
+                    except Exception:
+                        pass
+                logger.error(f"Docker execution error: {e}")
+                return False, f"Execution error: {str(e)}"
+            finally:
+                if container is not None:
+                    try:
+                        container.remove(force=True)
+                    except Exception:
+                        pass
+
+            # Collect outputs
+            generated_images = []
+            saved = sorted([f for f in os.listdir(out_dir) if f.startswith("output_") and f.endswith(".png")])
+
+            os.makedirs(output_dir, exist_ok=True)
+            for idx, fname in enumerate(saved, start=1):
+                src = os.path.join(out_dir, fname)
+                dest = os.path.join(output_dir, f"{output_prefix}_{idx}.png")
+                shutil.move(src, dest)
+                generated_images.append(dest)
+
+            return True, generated_images
+
+    def _instrument_code(self, code: str) -> str:
+        header = (
+            "import os\n"
+            "os.makedirs('/out/mplconfig', exist_ok=True)\n"
+            "os.makedirs('/out/.cache', exist_ok=True)\n"
+            "os.environ['MPLCONFIGDIR'] = '/out/mplconfig'\n"
+            "os.environ['XDG_CACHE_HOME'] = '/out/.cache'\n"
+            "os.environ['HOME'] = '/out'\n"
+            "os.environ.setdefault('FONTCONFIG_PATH', '/etc/fonts')\n"
+            "import matplotlib\n"
+            "matplotlib.use('Agg')\n"
+            "import numpy as np\n"
+            "import pandas as pd\n"
+            "import matplotlib.pyplot as plt\n"
+
+            # "import matplotlib\n"
+            # "matplotlib.use('Agg')\n"
+            # "import matplotlib.pyplot as plt\n"
+            # "import pandas as pd\n"
+            # "import numpy as np\n"
+        )
+
+        footer = """
+# Auto-save figures to /out (Appended by DockerExecutor)
+try:
+    figs = [plt.figure(n) for n in plt.get_fignums()]
+    for i, fig in enumerate(figs, start=1):
+        fig.savefig(f'/out/output_{i}.png', dpi=150, bbox_inches='tight')
+except Exception as e:
+    print(f"Failed to auto-save plots: {e}")
+"""
+        return header + "\n" + code + "\n" + footer
+
+class ResultInterpreter:
+    def __init__(self):
+        init_db()
+        self.max_retries = 2
+        self.plan_repo = PlanRepository()
+        
+        qwen_client = LLM(provider="qwen", model="qwen-max")
+        base_llm = LLMService(client=qwen_client)
+        exec_llm = PlanExecutorLLMService(llm=base_llm)
+        self.plan_executor = PlanExecutor(llm_service=exec_llm)
+        self.docker_executor = DockerExecutor(image="agent-plotter")
+
+    def interpret(self, result_content: str, context_description: str, file_paths: Optional[List[str]] = None, output_name: Optional[str] = None) -> Dict[str, Any]:
+        logger.info(f"Interpreting result for: {context_description}")
+
+        file_content = ""
+        if file_paths:
+            file_content = self._process_files(file_paths)
+
+        full_content = result_content
+        if file_content:
+            full_content += "\n\n" + file_content
+
+        if not output_name:
+            import uuid
+            output_name = f"analysis_{uuid.uuid4().hex[:8]}"
+
+        # 1. Create a Research Plan for Analysis
+        plan_tree = self.plan_repo.create_plan(
+            title=f"Analysis of {context_description}",
+            description=f"Automated analysis for {context_description}",
+            metadata={ "data": full_content }
+        )
+
+        # 2. Create Tasks
+        # We define a fixed strategy: Text Analysis and Chart Generation.
+        
+        data_snippet = full_content #[:50000] # Safe limit for context
+        
+        # Task 1: Textual Analysis (use shared prompt template)
+        analysis_instruction = ANALYSIS_PROMPT.format(
+            context_description=context_description,
+            result_content=data_snippet,
+        )
+        self.plan_repo.create_task(
+            plan_id=plan_tree.id,
+            name="Textual Analysis",
+            instruction=analysis_instruction,
+            position=1
+        )
+
+        # Task 2: Chart Generation (let the model pick appropriate chart types)
+        chart_instruction = CHART_CODE_PROMPT.format(
+            result_content=data_snippet
+        )
+        self.plan_repo.create_task(
+            plan_id=plan_tree.id,
+            name="Chart Generation",
+            instruction=chart_instruction,
+            position=2
+        )
+
+        # 3. Execute Plan
+        logger.info(f"Executing plan {plan_tree.id}...")
+        execution_summary = self.plan_executor.execute_plan(plan_id=plan_tree.id)
+        
+        # 4. Aggregate Results
+        final_analysis = ""
+        generated_charts = []
+        
+        results_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "results"))
+        os.makedirs(results_dir, exist_ok=True)
+
+        for res in execution_summary.results:
+            code = self._extract_code(res.content)
+            if code and ("matplotlib" in code or "plt." in code):
+                desc = self._extract_description(res.content)
+                if desc:
+                    print("--- Chart Description ---")
+                    print(desc)
+                    print("-------------------------")
+                print(f"--- Generated Chart Code ---\n{code}\n------------------------CODE END----")
+                # Pass original file_paths to execute, so they can be mounted
+                success, images = self._execute_code(code, os.path.join(results_dir, output_name), file_paths or [])
+                if success:
+                    generated_charts.extend(images)
+            else:
+                final_analysis += f"\n\n### Result from {res.task_id}\n{res.content}"
+
+        return {
+            "analysis": final_analysis,
+            "charts": list(set(generated_charts)), # Unique paths
+            "original_context": context_description,
+            "plan_id": plan_tree.id
+        }
+
+    def _process_files(self, file_paths: List[str]) -> str:
+        processed_data = []
+        for file_path in file_paths:
+            if not os.path.exists(file_path):
+                processed_data.append(f"File not found: {file_path}")
+                continue
+            
+            file_name = os.path.basename(file_path)
+            # Instruct LLM where the file will be in the docker env
+            docker_path = f"/data/{file_name}"
+            ext = os.path.splitext(file_name)[1].lower()
+            
+            try:
+                content_preview = ""
+                columns_info = ""
+                
+                # Check for table-like formats
+                if ext in ['.csv', '.tsv', '.xlsx', '.xls']:
+                    if ext == '.csv':
+                        df = pd.read_csv(file_path)
+                    elif ext == '.tsv':
+                        df = pd.read_csv(file_path, sep='\t')
+                    else:
+                        df = pd.read_excel(file_path)
+                    
+                    rows, cols = df.shape
+                    columns_info = ", ".join(df.columns.tolist())
+                    
+                    # Convert head to csv string for preview (reduced to 2 rows)
+                    content_preview = df.head(2).to_csv(index=False)
+                    
+                    # Provide reduced sample for first 2 columns (only 5 rows)
+                    first_cols = df.iloc[:, :2].head(5) 
+                    first_cols_str = first_cols.to_csv(index=False)
+
+                    processed_data.append(
+                        f"### File: {file_name}\n"
+                        f"- **Docker Path**: `{docker_path}`\n"
+                        f"- **Shape**: {rows} rows, {cols} columns\n"
+                        f"- **Columns**: {columns_info}\n"
+                        f"- **Data Preview (First 2 rows)**:\n{content_preview}\n"
+                        f"- **First 2 Columns Sample (First 5 rows)**:\n{first_cols_str}\n"
+                        f"(Note: The full file is available at `{docker_path}`. "
+                        f"Use pandas to read it directly, e.g., `pd.read_csv('{docker_path}')`)"
+                    )
+                else:
+                    # For other files, just mention existence or read small head
+                     processed_data.append(
+                        f"### File: {file_name}\n"
+                        f"- **Docker Path**: `{docker_path}`\n"
+                        f"(Non-tabular file. Please read content from `{docker_path}` if needed.)"
+                     )
+
+            except Exception as e:
+                processed_data.append(f"### File: {file_name}\nStatus: Error reading preview: {str(e)}")
+        
+        return "\n\n".join(processed_data)
+
+    def _extract_code(self, text: str) -> Optional[str]:
+        """Extracts python code from markdown code blocks."""
+        pattern = r"```python(.*?)```"
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return self._normalize_code_newlines(match.group(1).strip())
+        pattern_generic = r"```(.*?)```"
+        match_generic = re.search(pattern_generic, text, re.DOTALL)
+        if match_generic:
+             return self._normalize_code_newlines(match_generic.group(1).strip())
+        return None
+
+    def _normalize_code_newlines(self, code: str) -> str:
+        """Fix cases where the model returns escaped newlines instead of real ones."""
+        if code.count("\n") <= 1 and "\\n" in code:
+            candidate = code.replace("\\n", "\n")
+            if candidate.count("\n") > code.count("\n"):
+                return candidate
+        return code
+
+    def _extract_description(self, text: str) -> str:
+        """Extract non-code text as description for logging."""
+        # Remove code blocks
+        cleaned = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+        return cleaned.strip()
+
+    def _execute_code(self, code: str, output_prefix: str, data_files: List[str] = []) -> Any:
+        """Execute chart code using DockerExecutor."""
+        return self.docker_executor.execute(code, output_prefix, data_files)
+
+interpreter = ResultInterpreter()
