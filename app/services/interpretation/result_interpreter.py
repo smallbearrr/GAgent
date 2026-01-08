@@ -16,22 +16,17 @@ try:
 except ImportError:
     DOCKER_AVAILABLE = False
 
-# Check matplotlib availability
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 import pandas as pd
 
 from app.llm import LLMClient as LLM
 from app.services.llm.llm_service import LLMService
+from app.services.interpretation.data_process import DataProcessor
 from app.services.interpretation.prompts import (
     INTERPRETATION_SYSTEM_PROMPT,
-    ANALYSIS_PROMPT,
     CHART_CODE_PROMPT,
     CHART_CODE_FIX_PROMPT,
 )
@@ -157,23 +152,17 @@ class DockerExecutor:
             "import numpy as np\n"
             "import pandas as pd\n"
             "import matplotlib.pyplot as plt\n"
-
-            # "import matplotlib\n"
-            # "matplotlib.use('Agg')\n"
-            # "import matplotlib.pyplot as plt\n"
-            # "import pandas as pd\n"
-            # "import numpy as np\n"
         )
 
         footer = """
-# Auto-save figures to /out (Appended by DockerExecutor)
-try:
-    figs = [plt.figure(n) for n in plt.get_fignums()]
-    for i, fig in enumerate(figs, start=1):
-        fig.savefig(f'/out/output_{i}.png', dpi=150, bbox_inches='tight')
-except Exception as e:
-    print(f"Failed to auto-save plots: {e}")
-"""
+                # Auto-save figures to /out (Appended by DockerExecutor)
+                try:
+                    figs = [plt.figure(n) for n in plt.get_fignums()]
+                    for i, fig in enumerate(figs, start=1):
+                        fig.savefig(f'/out/output_{i}.png', dpi=150, bbox_inches='tight')
+                except Exception as e:
+                    print(f"Failed to auto-save plots: {e}")
+                """
         return header + "\n" + code + "\n" + footer
 
 class ResultInterpreter:
@@ -211,23 +200,11 @@ class ResultInterpreter:
         )
 
         # 2. Create Tasks
-        # We define a fixed strategy: Text Analysis and Chart Generation.
+        # We define a fixed strategy: Chart Generation only.
         
         data_snippet = full_content #[:50000] # Safe limit for context
-        
-        # Task 1: Textual Analysis (use shared prompt template)
-        analysis_instruction = ANALYSIS_PROMPT.format(
-            context_description=context_description,
-            result_content=data_snippet,
-        )
-        self.plan_repo.create_task(
-            plan_id=plan_tree.id,
-            name="Textual Analysis",
-            instruction=analysis_instruction,
-            position=1
-        )
 
-        # Task 2: Chart Generation (let the model pick appropriate chart types)
+        # Task 1: Chart Generation (let the model pick appropriate chart types)
         chart_instruction = CHART_CODE_PROMPT.format(
             result_content=data_snippet
         )
@@ -235,7 +212,7 @@ class ResultInterpreter:
             plan_id=plan_tree.id,
             name="Chart Generation",
             instruction=chart_instruction,
-            position=2
+            position=1
         )
 
         # 3. Execute Plan
@@ -243,7 +220,6 @@ class ResultInterpreter:
         execution_summary = self.plan_executor.execute_plan(plan_id=plan_tree.id)
         
         # 4. Aggregate Results
-        final_analysis = ""
         generated_charts = []
         
         results_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "results"))
@@ -262,72 +238,51 @@ class ResultInterpreter:
                 success, images = self._execute_code(code, os.path.join(results_dir, output_name), file_paths or [])
                 if success:
                     generated_charts.extend(images)
-            else:
-                final_analysis += f"\n\n### Result from {res.task_id}\n{res.content}"
 
         return {
-            "analysis": final_analysis,
+            "analysis": "",
             "charts": list(set(generated_charts)), # Unique paths
             "original_context": context_description,
             "plan_id": plan_tree.id
         }
 
     def _process_files(self, file_paths: List[str]) -> str:
-        processed_data = []
+        processed_data: List[str] = []
         for file_path in file_paths:
             if not os.path.exists(file_path):
-                processed_data.append(f"File not found: {file_path}")
+                processed_data.append(f"### File: {os.path.basename(file_path)}\nStatus: File not found: {file_path}")
                 continue
-            
+
             file_name = os.path.basename(file_path)
-            # Instruct LLM where the file will be in the docker env
             docker_path = f"/data/{file_name}"
             ext = os.path.splitext(file_name)[1].lower()
-            
-            try:
-                content_preview = ""
-                columns_info = ""
-                
-                # Check for table-like formats
-                if ext in ['.csv', '.tsv', '.xlsx', '.xls']:
-                    if ext == '.csv':
-                        df = pd.read_csv(file_path)
-                    elif ext == '.tsv':
-                        df = pd.read_csv(file_path, sep='\t')
-                    else:
-                        df = pd.read_excel(file_path)
-                    
-                    rows, cols = df.shape
-                    columns_info = ", ".join(df.columns.tolist())
-                    
-                    # Convert head to csv string for preview (reduced to 2 rows)
-                    content_preview = df.head(2).to_csv(index=False)
-                    
-                    # Provide reduced sample for first 2 columns (only 5 rows)
-                    first_cols = df.iloc[:, :2].head(5) 
-                    first_cols_str = first_cols.to_csv(index=False)
 
+            # We pass metadata (not raw data previews) to LLM to keep context small and structured.
+            if ext in [".csv", ".tsv", ".mat"]:
+                try:
+                    metadata = DataProcessor.get_metadata(file_path)
+                    metadata_json = metadata.model_dump_json(indent=2)
                     processed_data.append(
-                        f"### File: {file_name}\n"
+                        f"### File Metadata: {file_name}\n"
                         f"- **Docker Path**: `{docker_path}`\n"
-                        f"- **Shape**: {rows} rows, {cols} columns\n"
-                        f"- **Columns**: {columns_info}\n"
-                        f"- **Data Preview (First 2 rows)**:\n{content_preview}\n"
-                        f"- **First 2 Columns Sample (First 5 rows)**:\n{first_cols_str}\n"
+                        f"- **Metadata (JSON)**:\n"
+                        f"```json\n{metadata_json}\n```\n"
                         f"(Note: The full file is available at `{docker_path}`. "
-                        f"Use pandas to read it directly, e.g., `pd.read_csv('{docker_path}')`)"
+                        f"If you need raw data for charts, read it inside code using pandas/scipy.)"
                     )
-                else:
-                    # For other files, just mention existence or read small head
-                     processed_data.append(
-                        f"### File: {file_name}\n"
+                except Exception as e:
+                    processed_data.append(
+                        f"### File Metadata: {file_name}\n"
                         f"- **Docker Path**: `{docker_path}`\n"
-                        f"(Non-tabular file. Please read content from `{docker_path}` if needed.)"
-                     )
+                        f"Status: Error generating metadata: {str(e)}"
+                    )
+            else:
+                processed_data.append(
+                    f"### File: {file_name}\n"
+                    f"- **Docker Path**: `{docker_path}`\n"
+                    f"(Unsupported for metadata extraction; please read content from `{docker_path}` if needed.)"
+                )
 
-            except Exception as e:
-                processed_data.append(f"### File: {file_name}\nStatus: Error reading preview: {str(e)}")
-        
         return "\n\n".join(processed_data)
 
     def _extract_code(self, text: str) -> Optional[str]:
