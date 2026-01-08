@@ -2,13 +2,10 @@ import json
 import logging
 import os
 import re
-import glob
-import traceback
 import uuid
 import tempfile
 import shutil
 from typing import Any, Dict, List, Optional
-import asyncio
 
 try:
     import docker
@@ -16,23 +13,14 @@ try:
 except ImportError:
     DOCKER_AVAILABLE = False
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
-import pandas as pd
-
 from app.llm import LLMClient as LLM
 from app.services.llm.llm_service import LLMService
 from app.services.interpretation.data_process import DataProcessor
 from app.services.interpretation.prompts import (
-    INTERPRETATION_SYSTEM_PROMPT,
-    CHART_CODE_PROMPT,
-    CHART_CODE_FIX_PROMPT,
+    INTERACTIVE_ANALYSIS_SYSTEM_PROMPT,
 )
 from app.database import init_db
 from app.repository.plan_repository import PlanRepository
-from app.services.plans.plan_executor import PlanExecutor, PlanExecutorLLMService
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +45,7 @@ class DockerExecutor:
         output_dir = os.path.dirname(output_path)
         output_prefix = os.path.basename(output_path)
 
-        code = self._instrument_code(code)
+        code = self._instrument_code(code, autosave=True)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             in_dir = os.path.join(temp_dir, "in")
@@ -138,7 +126,77 @@ class DockerExecutor:
 
             return True, generated_images
 
-    def _instrument_code(self, code: str) -> str:
+    def execute_compute(self, code: str, data_files: List[str] = []) -> Any:
+        if not self.client:
+            return False, "Docker client not available."
+
+        code = self._instrument_code(code, autosave=False)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            in_dir = os.path.join(temp_dir, "in")
+            out_dir = os.path.join(temp_dir, "out")
+            data_dir = os.path.join(temp_dir, "data")
+            os.makedirs(in_dir, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
+            os.makedirs(data_dir, exist_ok=True)
+
+            for fp in data_files:
+                if os.path.exists(fp):
+                    try:
+                        shutil.copy(fp, data_dir)
+                    except Exception as e:
+                        logger.warning(f"Failed to copy data file {fp} to container context: {e}")
+
+            script_path = os.path.join(in_dir, "run.py")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(code)
+
+            container = None
+            try:
+                container = self.client.containers.run(
+                    image=self.image,
+                    command="python /in/run.py",
+                    volumes={
+                        os.path.abspath(in_dir): {"bind": "/in", "mode": "ro"},
+                        os.path.abspath(out_dir): {"bind": "/out", "mode": "rw"},
+                        os.path.abspath(data_dir): {"bind": "/data", "mode": "ro"},
+                    },
+                    working_dir="/out",
+                    network_mode="none",
+                    read_only=True,
+                    detach=True,
+                    stderr=True,
+                    stdout=True,
+                    mem_limit="4g",
+                    pids_limit=128,
+                    nano_cpus=2_000_000_000,
+                )
+
+                res = container.wait(timeout=self.timeout_s)
+                status = res.get("StatusCode", 1)
+                logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+
+                if status != 0:
+                    logger.error(f"Docker compute failed (exit={status}). Logs:\n{logs}")
+                    return False, f"Execution failed (exit={status}). Logs:\n{logs}"
+                return True, logs.strip()
+
+            except Exception as e:
+                if container is not None:
+                    try:
+                        container.kill()
+                    except Exception:
+                        pass
+                logger.error(f"Docker compute error: {e}")
+                return False, f"Execution error: {str(e)}"
+            finally:
+                if container is not None:
+                    try:
+                        container.remove(force=True)
+                    except Exception:
+                        pass
+
+    def _instrument_code(self, code: str, *, autosave: bool) -> str:
         header = (
             "import os\n"
             "os.makedirs('/out/mplconfig', exist_ok=True)\n"
@@ -154,15 +212,19 @@ class DockerExecutor:
             "import matplotlib.pyplot as plt\n"
         )
 
-        footer = """
-                # Auto-save figures to /out (Appended by DockerExecutor)
-                try:
-                    figs = [plt.figure(n) for n in plt.get_fignums()]
-                    for i, fig in enumerate(figs, start=1):
-                        fig.savefig(f'/out/output_{i}.png', dpi=150, bbox_inches='tight')
-                except Exception as e:
-                    print(f"Failed to auto-save plots: {e}")
-                """
+        if not autosave:
+            return header + "\n" + code + "\n"
+
+        footer = (
+            "\n"
+            "# Auto-save figures to /out (Appended by DockerExecutor)\n"
+            "try:\n"
+            "    figs = [plt.figure(n) for n in plt.get_fignums()]\n"
+            "    for i, fig in enumerate(figs, start=1):\n"
+            "        fig.savefig(f'/out/output_{i}.png', dpi=150, bbox_inches='tight')\n"
+            "except Exception as e:\n"
+            "    print(f\"Failed to auto-save plots: {e}\")\n"
+        )
         return header + "\n" + code + "\n" + footer
 
 class ResultInterpreter:
@@ -173,9 +235,9 @@ class ResultInterpreter:
         
         qwen_client = LLM(provider="qwen", model="qwen-max")
         base_llm = LLMService(client=qwen_client)
-        exec_llm = PlanExecutorLLMService(llm=base_llm)
-        self.plan_executor = PlanExecutor(llm_service=exec_llm)
         self.docker_executor = DockerExecutor(image="agent-plotter")
+        self.interactive_llm = base_llm
+        self.max_interactive_turns = 4
 
     def interpret(self, result_content: str, context_description: str, file_paths: Optional[List[str]] = None, output_name: Optional[str] = None) -> Dict[str, Any]:
         logger.info(f"Interpreting result for: {context_description}")
@@ -192,59 +254,103 @@ class ResultInterpreter:
             import uuid
             output_name = f"analysis_{uuid.uuid4().hex[:8]}"
 
-        # 1. Create a Research Plan for Analysis
+        return self._interactive_interpret(
+            result_content=full_content,
+            context_description=context_description,
+            file_paths=file_paths or [],
+            output_name=output_name,
+        )
+
+    def _interactive_interpret(
+        self,
+        *,
+        result_content: str,
+        context_description: str,
+        file_paths: List[str],
+        output_name: Optional[str],
+    ) -> Dict[str, Any]:
         plan_tree = self.plan_repo.create_plan(
             title=f"Analysis of {context_description}",
-            description=f"Automated analysis for {context_description}",
-            metadata={ "data": full_content }
+            description=f"Interactive analysis for {context_description}",
+            metadata={"data": result_content},
         )
 
-        # 2. Create Tasks
-        # We define a fixed strategy: Chart Generation only.
-        
-        data_snippet = full_content #[:50000] # Safe limit for context
+        if not output_name:
+            output_name = f"analysis_{uuid.uuid4().hex[:8]}"
 
-        # Task 1: Chart Generation (let the model pick appropriate chart types)
-        chart_instruction = CHART_CODE_PROMPT.format(
-            result_content=data_snippet
-        )
-        self.plan_repo.create_task(
-            plan_id=plan_tree.id,
-            name="Chart Generation",
-            instruction=chart_instruction,
-            position=1
-        )
-
-        # 3. Execute Plan
-        logger.info(f"Executing plan {plan_tree.id}...")
-        execution_summary = self.plan_executor.execute_plan(plan_id=plan_tree.id)
-        
-        # 4. Aggregate Results
-        generated_charts = []
-        
         results_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "results"))
         os.makedirs(results_dir, exist_ok=True)
 
-        for res in execution_summary.results:
-            code = self._extract_code(res.content)
-            if code and ("matplotlib" in code or "plt." in code):
-                desc = self._extract_description(res.content)
-                if desc:
-                    print("--- Chart Description ---")
-                    print(desc)
-                    print("-------------------------")
-                print(f"--- Generated Chart Code ---\n{code}\n------------------------CODE END----")
-                # Pass original file_paths to execute, so they can be mounted
-                success, images = self._execute_code(code, os.path.join(results_dir, output_name), file_paths or [])
-                if success:
-                    generated_charts.extend(images)
+        messages = [
+            {"role": "system", "content": INTERACTIVE_ANALYSIS_SYSTEM_PROMPT.strip()},
+            {
+                "role": "user",
+                "content": (
+                    f"Context Description: {context_description}\n\n"
+                    f"Result Content and Metadata:\n{result_content}"
+                ),
+            },
+        ]
 
-        return {
-            "analysis": "",
-            "charts": list(set(generated_charts)), # Unique paths
-            "original_context": context_description,
-            "plan_id": plan_tree.id
-        }
+        for turn in range(1, self.max_interactive_turns + 1):
+            response_text = self.interactive_llm.chat("", messages=messages)
+            payload = self._parse_json(response_text)
+            action = (payload.get("action") or "").strip().lower()
+
+            if action == "compute":
+                code = self._extract_code(payload.get("code", ""))
+                if not code:
+                    raise ValueError("LLM compute response missing python code.")
+                success, output = self.docker_executor.execute_compute(code, file_paths)
+                output_text = output if success else f"ERROR: {output}"
+                output_text = self._truncate_output(output_text)
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Computation output (turn {turn}):\n{output_text}\n"
+                            "If more data is needed, request another computation."
+                        ),
+                    }
+                )
+                continue
+
+            if action == "final":
+                chart_code = self._extract_code(payload.get("chart_code", ""))
+                if not chart_code:
+                    raise ValueError("LLM final response missing chart code.")
+                success, images = self._execute_code(
+                    chart_code,
+                    os.path.join(results_dir, output_name),
+                    file_paths,
+                )
+                if not success:
+                    raise RuntimeError(f"Chart code execution failed: {images}")
+                analysis_md = self._build_analysis_markdown(
+                    summary_md=payload.get("summary_md", ""),
+                    figures=payload.get("figures", []),
+                    images=images,
+                )
+                return {
+                    "analysis": analysis_md,
+                    "charts": images,
+                    "original_context": context_description,
+                    "plan_id": plan_tree.id,
+                }
+
+            messages.append({"role": "assistant", "content": response_text})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The response was not valid. "
+                        "Please return JSON with action compute or final."
+                    ),
+                }
+            )
+
+        raise RuntimeError("Interactive analysis did not complete within turn limit.")
 
     def _process_files(self, file_paths: List[str]) -> str:
         processed_data: List[str] = []
@@ -314,5 +420,54 @@ class ResultInterpreter:
     def _execute_code(self, code: str, output_prefix: str, data_files: List[str] = []) -> Any:
         """Execute chart code using DockerExecutor."""
         return self.docker_executor.execute(code, output_prefix, data_files)
+
+    def _parse_json(self, text: str) -> Dict[str, Any]:
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            while lines and lines[-1].strip().startswith("```"):
+                lines.pop()
+            cleaned = "\n".join(lines).strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            logger.error("Failed to parse JSON from LLM: %s", text)
+            raise ValueError(f"Invalid JSON from LLM: {exc}") from exc
+
+    def _truncate_output(self, text: str, limit: int = 6000) -> str:
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "\n...<truncated>..."
+
+    def _build_analysis_markdown(
+        self,
+        *,
+        summary_md: str,
+        figures: List[Dict[str, Any]],
+        images: List[str],
+    ) -> str:
+        sections = []
+        if summary_md:
+            sections.append(summary_md.strip())
+        pairs = min(len(figures), len(images))
+        for idx in range(pairs):
+            fig = figures[idx] or {}
+            title = fig.get("title") or f"Figure {idx + 1}"
+            description = fig.get("description_md") or ""
+            sections.append(f"### {title}\n")
+            sections.append(f"![{title}]({images[idx]})\n")
+            if description:
+                sections.append(description.strip())
+        if len(figures) > pairs:
+            for idx in range(pairs, len(figures)):
+                fig = figures[idx] or {}
+                title = fig.get("title") or f"Figure {idx + 1}"
+                description = fig.get("description_md") or ""
+                sections.append(f"### {title}\n")
+                if description:
+                    sections.append(description.strip())
+        return "\n\n".join(section for section in sections if section)
 
 interpreter = ResultInterpreter()

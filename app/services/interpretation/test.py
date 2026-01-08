@@ -170,6 +170,63 @@ def test_basic_functionality():
                 print(f"Error removing temporary file: {e}")
 
 
+def test_tsv_functionality():
+    context_description = "TSV Sample Analysis"
+    result_content = "Small TSV dataset for validation."
+
+    print(f"\n{'='*20} TSV 测试 {'='*20}")
+    print(f"上下文描述: {context_description}")
+
+    data_file_path = os.path.join(os.path.dirname(__file__), "test_sample.tsv")
+    with open(data_file_path, "w", encoding="utf-8") as f:
+        f.write("Sample\tGroup\tMetricA\tMetricB\n")
+        f.write("S1\tControl\t10\t0.5\n")
+        f.write("S2\tControl\t12\t0.7\n")
+        f.write("S3\tTreatment\t18\t1.4\n")
+        f.write("S4\tTreatment\t22\t1.6\n")
+
+    try:
+        output_name = "test_tsv_analysis"
+        print(f"Calling interpreter (saving to results/{output_name}*)...")
+
+        result = interpreter.interpret(
+            result_content=result_content,
+            context_description=context_description,
+            file_paths=[data_file_path],
+            output_name=output_name,
+        )
+
+        results_dir = os.path.join(os.path.dirname(__file__), "results")
+        os.makedirs(results_dir, exist_ok=True)
+        md_path = os.path.join(results_dir, f"{output_name}_analysis.md")
+        try:
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(result.get("analysis", ""))
+            print(f"Analysis text saved to: {md_path}")
+        except Exception as e:
+            print(f"Failed to save analysis text: {e}")
+
+        print("\n[TSV] 生成的图表 (Charts):")
+        charts = result.get("charts", [])
+        if charts:
+            for chart in charts:
+                print(f" - Generated chart: {chart}")
+        else:
+            print("未生成图表 (No charts generated or found).")
+
+    except Exception as e:
+        print(f"TSV 测试过程中发生错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+    finally:
+        if os.path.exists(data_file_path):
+            try:
+                os.remove(data_file_path)
+                print(f"Removed temporary TSV file: {data_file_path}")
+            except Exception as e:
+                print(f"Error removing TSV file: {e}")
+
 
 if __name__ == "__main__":
     test_analysis_with_files(
@@ -179,3 +236,4 @@ if __name__ == "__main__":
         data_description="基于宏基因组测序数据，首先对原始测序数据进行去接头、去低质量序列及宿主序列去除等预处理，获得用于后续分析的有效数据（CleanData）。随后使用 MEGAHIT 对每个样本的有效数据进行 de novo 组装，并基于组装得到的 contigs 采用 prodigal 软件进行基因预测，通过 CD-HIT 去冗余获得非冗余的 Unigenes 集。基于 Unigene 的蛋白序列，采用 Diamond 软件与 KEGG（Kyoto Encyclopedia of Genes and Genomes）数据库进行比对注释，获得各 Unigene 对应的 KEGG 注释信息。根据比对上 reads 的数目及各 Unigene 的长度，计算各 Unigene 在每个样本中的丰度信息，并在功能注释层面对 KEGG 通路进行丰度统计与比较分析，从而获得各样本在不同 KEGG Pathway 水平上的丰度矩阵，用于后续的统计分析与可视化展示。"
     )
     # test_basic_functionality()
+    # test_tsv_functionality()
